@@ -14,6 +14,12 @@ from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import webrtcvad
 import wave
+import requests
+import sseclient
+import noisereduce as nr
+from scipy.io import wavfile
+from df.enhance import enhance, init_df, load_audio, save_audio
+from df.utils import download_file
 
 app = FastAPI()
 app.add_middleware(
@@ -28,64 +34,16 @@ processor = WhisperProcessor.from_pretrained("openai/whisper-large")
 model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large").to('mps')
 model.config.forced_decoder_ids = None
 
-vad_model = AutoModel(model="paraformer-zh", model_revision="v2.0.4",
-                  vad_model="fsmn-vad", vad_model_revision="v2.0.4",
-                  punc_model="ct-punc-c", punc_model_revision="v2.0.4",
-                  spk_model="cam++", spk_model_revision="v2.0.2",
-                  )
+# vad_model = AutoModel(model="paraformer-zh", model_revision="v2.0.4",
+#                   vad_model="fsmn-vad", vad_model_revision="v2.0.4",
+#                   punc_model="ct-punc-c", punc_model_revision="v2.0.4",
+#                   spk_model="cam++", spk_model_revision="v2.0.2",
+#                   )
 vad = webrtcvad.Vad()
 
 # Directory for temporary files
 TEMP_DIR = "temp_audio"
 os.makedirs(TEMP_DIR, exist_ok=True)
-
-def filter_silence(audio, threshold=0.05): 
-    """
-    Filter out silent or very low-amplitude parts of the audio.
-    """
-    normalized_audio = audio / np.max(np.abs(audio))
-    return normalized_audio[np.abs(normalized_audio) > threshold]
-
-def reduce_noise(audio, noise_reduction_factor=0.9):
-    """
-    Reduce background noise using spectral gating.
-    """
-    # Estimate noise from the beginning of the audio
-    noise_sample = audio[:int(0.1 * len(audio))]  # First 10% of the audio
-    noise_mean = np.mean(audio)
-    noise_std = np.std(audio)
-    
-    # Reduce noise by subtracting mean and scaling
-    denoised_audio = np.where(
-        np.abs(audio - noise_mean) > noise_reduction_factor * noise_std, 
-        audio, 
-        0
-    )
-    return denoised_audio
-
-def preprocess_audio(audio_buffer, sampling_rate):
-    """
-    Preprocess audio: filter noise, silence, and resample to 16 kHz.
-    """
-    # Convert from Tensor to NumPy
-    waveform = audio_buffer.squeeze().numpy()
-
-    # Noise reduction
-    noise_sample = waveform[:int(0.1 * len(waveform))]  # Use first 10% as noise sample
-
-    # Silence filtering
-    filtered_waveform = filter_silence(denoised_waveform)
-
-    # Check if valid audio remains
-    if len(filtered_waveform) == 0:
-        raise ValueError("Audio too noisy or silent after preprocessing.")
-
-    # Resample to 16 kHz if needed
-    if sampling_rate != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=16000)
-        filtered_waveform = resampler(torch.tensor(filtered_waveform)).numpy()
-
-    return filtered_waveform
 
 @app.post("/transcribe-buffer")
 async def transcribe_buffer(request: Request):
@@ -139,13 +97,20 @@ async def transcribe_buffer(request: Request):
         print(e)
         raise HTTPException(status_code=400, detail=f"Error processing audio: {str(e)}")
 
+def re_sample_audio(audio_path, sr):
+    print("Resampling audio")
+    audio, _ = librosa.load(audio_path, sr=16000)
+    audio_resampled = librosa.resample(audio, target_sr=sr, orig_sr=16000)
+    sf.write(audio_path, audio_resampled, 48000)
+    print("Resampling done")
+
 @app.websocket("/ws/transcribe-buffer")
 async def transcribe_websocket(websocket: WebSocket):
     await websocket.accept()
     sec = 0
     buffer = []
     bufferLength = 2000
-    threashold = 70
+    threashold = 90
 
     try:
         while True:
@@ -175,8 +140,18 @@ async def transcribe_websocket(websocket: WebSocket):
             if start_time < 0:
                 start_time = len(audio) - 1000  # Duration is in milliseconds
 
+            bufferFileName = f"temp_audio/temp{audio_id}_.wav"
             last_one_second = audio[start_time:]
-            last_one_second.export(f"temp_audio/temp{audio_id}_.wav", format="wav")  # Export trimmed audio
+            last_one_second.export(bufferFileName, format="wav")  # Export trimmed audio
+
+            # rate, data = wavfile.read(bufferFileName)
+            # reduced_noise = nr.reduce_noise(y=data, sr=rate)
+            # wavfile.write(bufferFileName, rate, reduced_noise)
+
+            model, df_state, _ = init_df()
+            audio, _ = load_audio(bufferFileName, sr=df_state.sr() * 2)
+            enhanced = enhance(model, df_state, audio)
+            save_audio(bufferFileName, enhanced, df_state.sr())
 
             # Perform VAD model inference
             res = [{'text': ''}]
@@ -224,6 +199,7 @@ async def transcribe_websocket(websocket: WebSocket):
                     # else:
                         # print("No speech detected")
                 buffer.append(count)
+                count = 0
 
                 print(buffer)
             except Exception as e:
@@ -242,7 +218,9 @@ async def transcribe_websocket(websocket: WebSocket):
                     last_one_second.export(f"temp_audio/temp{audio_id}_.wav", format="wav")
                     transcription = process_audio(f"temp_audio/temp{audio_id}_.wav")
                     sec = 0
-                    await websocket.send_json({"transcription": transcription})
+                    print(f"Transcription: {transcription}")
+                    query(transcription)
+                    # await websocket.send_json({"transcription": transcription})
                 else:
                     await websocket.send_json(0)
             else:
@@ -264,6 +242,30 @@ async def transcribe_websocket(websocket: WebSocket):
         if os.path.exists(f"temp_audio/temp{audio_id}_.wav"):
             os.remove(f"temp_audio/temp{audio_id}_.wav")
 
+def query(content):
+    # Define the URL and payload
+    url = "http://192.168.1.22:4040/generate/stream"
+    payload = {
+        "role": "user",
+        "content": content
+    }
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    # Send a POST request
+    response = requests.post(url, json=payload, headers=headers, stream=True)
+
+    # Check for successful connection
+    if response.status_code == 200:
+        # Process the SSE stream
+        client = sseclient.SSEClient(response)
+        print("Listening to SSE stream...")
+        for event in client.events():
+            print(f"Received event: {event.data}")
+    else:
+        print(f"Failed to connect: {response.status_code}, {response.text}")
+
 def process_audio(file_path: str) -> str:
     """
     Process the WAV file using Whisper (your existing Whisper processing code).
@@ -279,11 +281,8 @@ def process_audio(file_path: str) -> str:
 
     # Preprocess the audio
     waveform = waveform.squeeze().numpy()  # Convert from Tensor to NumPy
-    denoised_waveform = reduce_noise(waveform)  # Apply noise reduction
-    filtered_waveform = filter_silence(denoised_waveform)  # Remove silence
-
     # Ensure the processed waveform has data to avoid errors
-    if len(filtered_waveform) == 0:
+    if len(waveform) == 0:
         raise ValueError("No valid audio data after preprocessing (too much noise or silence).")
 
     # Convert the processed audio to input features
@@ -304,4 +303,4 @@ def cleanup_temp_files():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=4041)
